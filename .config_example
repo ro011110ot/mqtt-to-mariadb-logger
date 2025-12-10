@@ -1,0 +1,17 @@
+# MQTT Broker Configuration
+MQTT_BROKER_HOST=your.mqtt.broker.com
+MQTT_BROKER_PORT=8883
+# Set to 'true' or 'false'
+MQTT_USE_SSL=true
+MQTT_USER=mqtt_user
+MQTT_PASSWORD=mqtt_password
+# Topic to subscribe to, '#' for all topics
+MQTT_TOPIC_SUBSCRIPTION=#
+
+# MariaDB/MySQL Database Configuration
+DB_HOST=localhost
+DB_PORT=3306
+DB_NAME=mqtt_log_db
+DB_USER=db_user
+DB_PASSWORD=db_password
+DB_TABLE=mqtt_messages

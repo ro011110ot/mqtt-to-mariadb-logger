@@ -1,0 +1,4 @@
+# Python libraries needed for the project
+paho-mqtt
+python-dotenv
+mysql-connector-python
