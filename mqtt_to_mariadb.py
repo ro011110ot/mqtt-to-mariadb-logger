@@ -226,4 +226,52 @@ def on_message(client, userdata, msg):
         print(f"[{topic}] -> Logged successfully to '{table_name}'.")
 
     except mysql.connector.Error as err:
-        print(f"[{topic}] Error logging")
+        print(f"[{topic}] Error logging to MariaDB: {err}")
+    finally:
+        if cursor:
+            cursor.close()
+        if db_conn:
+            db_conn.close()
+
+
+# --- Main Logic ---
+
+if __name__ == "__main__":
+
+    # 1. MQTT Client Setup (Paho V2 API)
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    # 2. Handle SSL/TLS
+    if CONFIG.get("MQTT_USE_SSL", "false").lower() == "true":
+        print("Attempting connection with SSL/TLS.")
+        client.tls_set(tls_version=ssl.PROTOCOL_TLS_CLIENT)
+
+    # 3. Handle Credentials
+    mqtt_user = CONFIG.get("MQTT_USER")
+    mqtt_pass = CONFIG.get("MQTT_PASSWORD")
+    if mqtt_user and mqtt_pass:
+        client.username_pw_set(mqtt_user, mqtt_pass)
+
+    # 4. Connection
+    mqtt_host = CONFIG["MQTT_BROKER_HOST"]
+    mqtt_port = int(CONFIG["MQTT_BROKER_PORT"])
+
+    print(f"Connecting to MQTT broker at {mqtt_host}:{mqtt_port}...")
+    try:
+        client.connect(mqtt_host, mqtt_port, 60)
+    except Exception as e:
+        print(f"Could not connect to MQTT Broker: {e}")
+        exit(1)
+
+    # 5. Start the Loop
+    print("Starting MQTT listener loop...")
+    try:
+        client.loop_forever()
+    except KeyboardInterrupt:
+        print("\nProgram terminated by user.")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred in the main loop: {e}")
+
+    print("Program finished.")
