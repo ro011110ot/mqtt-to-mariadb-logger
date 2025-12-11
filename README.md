@@ -79,7 +79,7 @@ Add the following content (replace `ro011110ot` with your username and update th
     User=ro011110ot
     WorkingDirectory=/home/ro011110ot/scripts/mqtt-to-mariadb-logger
     # Explicit execution via shell to correctly activate the venv and ensure log collection
-    ExecStart=/bin/sh -c '. .venv/bin/activate && python mqtt_to_mariadb.py'
+    ExecStart=/bin/bash -c 'source .venv/bin/activate && python -u mqtt_to_mariadb.py'
     Restart=always
     RestartSec=5
     StandardOutput=journal
