@@ -14,4 +14,3 @@ DB_PORT=3306
 DB_NAME=mqtt_log_db
 DB_USER=db_user
 DB_PASSWORD=db_password
-DB_TABLE=mqtt_messages
