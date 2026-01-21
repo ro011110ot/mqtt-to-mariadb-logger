@@ -1,0 +1,18 @@
+[project]
+name = "mqtt-to-mariadb-logger"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "ro011110ot", email = "ro011110ot@mailbox.org" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "mysql-connector-python>=9.5.0",
+    "paho-mqtt>=2.1.0",
+    "python-dotenv>=1.2.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.22,<0.10.0"]
+build-backend = "uv_build"

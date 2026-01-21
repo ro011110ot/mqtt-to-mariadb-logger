@@ -1,277 +1,175 @@
-import paho.mqtt.client as mqtt
-import mysql.connector
-from dotenv import dotenv_values
-import ssl
 import json
-import time
+import ssl
+from pathlib import Path
 
-"""
-MQTT to MariaDB Logger
-----------------------
-This script subscribes to an MQTT topic, parses incoming JSON messages, 
-and logs them into a MariaDB/MySQL database.
+import mysql.connector
+import paho.mqtt.client as mqtt
+from dotenv import dotenv_values
 
-Key Features:
-- Dynamic Table Creation: Tables are created automatically based on the MQTT topic.
-- Dynamic Schema: Columns are created based on the keys in the JSON payload.
-- Type Inference: Maps Python types (str, int, float) to SQL types (VARCHAR, DECIMAL).
-"""
+# --- Load configuration ---
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / ".config"
+CONFIG = dotenv_values(CONFIG_PATH)
 
-# --- Configuration Loading ---
-# Ensures that a .config file exists with DB_HOST, DB_USER, DB_PASSWORD,
-# DB_NAME, MQTT_BROKER_HOST, MQTT_BROKER_PORT, and MQTT_TOPIC_SUBSCRIPTION.
-CONFIG = dotenv_values(".config")
+MQTT_SSL_PORT = 8883
 
-
-# --- Database / Helper Functions ---
 
 def connect_db():
-    """Establishes and returns a connection to the MariaDB/MySQL database."""
+    """Establish connection to MariaDB."""
     try:
         db = mysql.connector.connect(
             host=CONFIG.get("DB_HOST", "localhost"),
-            port=CONFIG.get("DB_PORT", 3306),
+            port=int(CONFIG.get("DB_PORT", 3306)),
             user=CONFIG["DB_USER"],
             password=CONFIG["DB_PASSWORD"],
-            database=CONFIG["DB_NAME"]
+            database=CONFIG["DB_NAME"],
         )
-        return db
     except mysql.connector.Error as err:
-        print(f"Error connecting to MariaDB: {err}")
+        print(f"Database connection error: {err}")
         return None
-
-
-def topic_to_table_name(topic):
-    """
-    Converts a topic string (e.g., 'Sensoren/DHT11') to a safe table name.
-    Preserves case sensitivity.
-    """
-    # Replaces slashes with underscores and removes plus signs
-    return topic.replace('/', '_').replace('+', '')
-
-
-def table_exists(cursor, table_name):
-    """
-    Checks if a given table exists in the current database.
-
-    Args:
-        cursor: The database cursor.
-        table_name (str): Name of the table to check.
-
-    Returns:
-        bool: True if table exists, False otherwise.
-    """
-    try:
-        # Executes a SELECT statement to check for table existence
-        cursor.execute(f"SELECT 1 FROM `{table_name}` LIMIT 1;")
-
-        # IMPORTANT: The result must be consumed (fetched),
-        # otherwise it blocks the next INSERT command (Unread result found error)!
-        cursor.fetchone()
-
-        return True
-    except mysql.connector.Error as err:
-        # Error code 1146 means 'Table doesn't exist'
-        if err.errno == 1146:
-            return False
-        print(f"Error checking table existence for '{table_name}': {err}")
-        return False
+    else:
+        return db
 
 
 def python_type_to_sql(value):
-    """
-    Translates Python data type to a suitable MariaDB data type.
-
-    Args:
-        value: The value to analyze.
-
-    Returns:
-        str: The corresponding SQL data type definition.
-    """
+    """Mapping Python types to SQL types."""
     if isinstance(value, (int, float)):
-        # DECIMALS provide better precision for sensor values than FLOAT
-        return "DECIMAL(10, 4)"
-    elif isinstance(value, str):
-        # VARCHAR for text status, names, IDs, etc.
-        return "VARCHAR(255)"
+        return "DECIMAL(10, 2)"
+    return "VARCHAR(100)"
+
+
+def table_exists(cursor, table_name):
+    """Check if table exists in database."""
+    try:
+        # S608: Table names must be dynamic here; names are sanitized manually.
+        cursor.execute(f"SELECT 1 FROM `{table_name}` LIMIT 1;")  # noqa: S608
+        cursor.fetchall()
+    except mysql.connector.Error:
+        return False
     else:
-        # Fallback for lists, booleans, dicts, etc., which are saved as text
-        return "TEXT"
+        return True
+
+
+def ensure_columns_exist(cursor, table_name, data):
+    """Check if all keys in data exist as columns, otherwise create them."""
+    cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+    existing_columns = [col[0] for col in cursor.fetchall()]
+
+    for key in data:
+        safe_key = key.replace(".", "_").replace("-", "_")
+        if safe_key not in existing_columns:
+            sql_type = python_type_to_sql(data[key])
+            alter_query = (
+                f"ALTER TABLE `{table_name}` ADD COLUMN `{safe_key}` {sql_type} NULL"
+            )
+            cursor.execute(alter_query)
+            print(f" -> Added missing column '{safe_key}' to table '{table_name}'.")
 
 
 def create_dynamic_table(cursor, table_name, data):
-    """
-    Creates a new table based on the keys and determined types from the JSON data.
-
-    Args:
-        cursor: The database cursor.
-        table_name (str): The name of the table to create.
-        data (dict): The JSON data dictionary to derive the schema from.
-    """
-    dynamic_columns = []
-
-    # 1. Collect column definitions based on the data
+    """Create a table based on JSON data keys."""
+    columns = []
     for key, value in data.items():
-        # Sanitize column names (replace dots and dashes with underscores)
-        safe_key = key.replace('.', '_').replace('-', '_')
+        safe_key = key.replace(".", "_").replace("-", "_")
+        columns.append(f"`{safe_key}` {python_type_to_sql(value)} NULL")
 
-        # Determine the appropriate SQL type based on the value's type
-        sql_type = python_type_to_sql(value)
-
-        # Add the definition (NULL allowed, as not every message might have all keys)
-        dynamic_columns.append(f"`{safe_key}` {sql_type} NULL")
-
-    # 2. Assemble the complete CREATE statement
-    columns_definition = ", ".join(dynamic_columns)
-
-    create_query = f"""
-    CREATE TABLE `{table_name}` (
+    query = f"""
+    CREATE TABLE IF NOT EXISTS `{table_name}` (
         id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-        timestamp TIMESTAMP NOT NULL,
-        sensor_id VARCHAR(100) NOT NULL,
-        {columns_definition}
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        sensor_id VARCHAR(100),
+        {", ".join(columns)}
     );
     """
-
-    try:
-        cursor.execute(create_query)
-        print(f" -> NEW TABLE created: '{table_name}'. Schema: {columns_definition}")
-        return True
-    except mysql.connector.Error as err:
-        print(f" -> ERROR creating table '{table_name}': {err}")
-        return False
+    cursor.execute(query)
+    print(f" -> Table '{table_name}' created.")
 
 
-# --- MQTT Callbacks ---
-
-def on_connect(client, userdata, flags, reason_code, properties):
-    """Callback function when the client connects to the broker (Paho V2)."""
+def on_connect(client, _userdata, _flags, reason_code, _properties):
+    """Callback for successful MQTT connection."""
     if reason_code == 0:
-        print("Connected to MQTT Broker successfully.")
-        topic = CONFIG["MQTT_TOPIC_SUBSCRIPTION"]
-        # Subscribe to the wildcard topic (e.g., 'Sensoren/#')
+        print("Connected successfully to MQTT broker.")
+        topic = CONFIG.get("MQTT_TOPIC_SUBSCRIPTION", "Sensors/#")
         client.subscribe(topic)
-        print(f"Subscribed to topic: {topic}")
+        print(f"Subscribed to: {topic}")
     else:
-        print(f"Failed to connect, return code {reason_code}")
+        print(f"Connection failed with code: {reason_code}")
 
 
-def on_message(client, userdata, msg):
-    """
-    Callback function when a message is received.
-    Parses JSON, checks/creates table, and inserts data.
-    """
+def on_message(_client, _userdata, msg):
+    """Callback for received MQTT messages."""
     topic = msg.topic
+    payload_str = msg.payload.decode("utf-8")
+    data = {}
+    sensor_id = "Unknown_Device"
 
-    # 1. Decode payload and parse JSON (Mandatory check)
     try:
-        payload_str = msg.payload.decode("utf-8")
-        data = json.loads(payload_str)
-
+        parsed = json.loads(payload_str)
+        if isinstance(parsed, dict):
+            data = parsed
+            sensor_id = str(data.pop("id", topic.split("/")[-1]))
+        else:
+            col_name = topic.split("/")[-1]
+            data = {col_name: parsed}
     except json.JSONDecodeError:
-        # Skip log if payload is not valid JSON
-        print(f"[{topic}] Log skipped: Payload is not valid JSON.")
-        return
-    except Exception as e:
-        print(f"[{topic}] Log skipped: Error processing payload. {e}")
-        return
-
-    table_name = topic_to_table_name(topic)
-
-    # 2. Extract 'id' and remove it from 'data' to treat it separately
-    # Assumption: The sensor sends its ID under the key 'id'
-    sensor_id = str(data.pop('id', 'UNKNOWN'))
+        col_name = topic.split("/")[-1]
+        try:
+            data = {col_name: float(payload_str)}
+        except ValueError:
+            data = {col_name: payload_str}
 
     db_conn = connect_db()
-    if db_conn is None:
+    if not db_conn:
         return
 
-    cursor = None
     try:
-        cursor = db_conn.cursor()
+        cursor = db_conn.cursor(buffered=True)
+        table_name = topic.replace("/", "_").replace("+", "").replace("-", "_")
 
-        # 3. Table check and creation (if necessary)
         if not table_exists(cursor, table_name):
-            # Creates the table based on the current data keys and types
             create_dynamic_table(cursor, table_name, data)
+        else:
+            ensure_columns_exist(cursor, table_name, data)
 
-        # 4. Data Insertion (Dynamic INSERT)
+        safe_keys = [k.replace(".", "_").replace("-", "_") for k in data]
+        cols = ["sensor_id"] + [f"`{k}`" for k in safe_keys]
+        placeholders = ["%s"] * len(cols)
 
-        # Base columns that are always present
-        insert_columns = ['timestamp', 'sensor_id']
-        insert_values = ['NOW()', '%s']
-        insert_data = [sensor_id]
+        # Move noqa here, where the string is constructed (S608)
+        query = (
+            f"INSERT INTO `{table_name}` ({', '.join(cols)}) "  # noqa: S608
+            f"VALUES ({', '.join(placeholders)})"
+        )
 
-        # Add dynamic columns and values from the JSON payload
-        for key, value in data.items():
-            safe_key = key.replace('.', '_').replace('-', '_')
-            insert_columns.append(f"`{safe_key}`")
-            insert_values.append('%s')
-            insert_data.append(value)  # value is passed directly (handled by mysql.connector)
-
-        # Assemble the query string
-        columns_str = ", ".join(insert_columns)
-        values_str = ", ".join(insert_values)
-
-        # Important: Backticks around table names to safely handle case sensitivity and special chars
-        add_message = f"""
-        INSERT INTO `{table_name}` 
-            ({columns_str}) 
-        VALUES 
-            ({values_str})
-        """
-
-        cursor.execute(add_message, tuple(insert_data))
+        cursor.execute(query, [sensor_id, *list(data.values())])
         db_conn.commit()
-        print(f"[{topic}] -> Logged successfully to '{table_name}'.")
+        print(f"[{topic}] Logged: {payload_str}")
 
-    except mysql.connector.Error as err:
-        print(f"[{topic}] Error logging to MariaDB: {err}")
+    except mysql.connector.Error as error:
+        print(f"Error during logging: {error}")
     finally:
-        if cursor:
-            cursor.close()
-        if db_conn:
-            db_conn.close()
+        db_conn.close()
 
-
-# --- Main Logic ---
 
 if __name__ == "__main__":
+    mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
 
-    # 1. MQTT Client Setup (Paho V2 API)
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    client.on_connect = on_connect
-    client.on_message = on_message
+    host = CONFIG.get("MQTT_BROKER_HOST", "localhost")
+    port = int(CONFIG.get("MQTT_BROKER_PORT", 1883))
 
-    # 2. Handle SSL/TLS
-    if CONFIG.get("MQTT_USE_SSL", "false").lower() == "true":
-        print("Attempting connection with SSL/TLS.")
-        client.tls_set(tls_version=ssl.PROTOCOL_TLS_CLIENT)
+    if CONFIG.get("MQTT_USE_SSL", "false").lower() == "true" or port == MQTT_SSL_PORT:
+        mqtt_client.tls_set(tls_version=ssl.PROTOCOL_TLS_CLIENT)
 
-    # 3. Handle Credentials
-    mqtt_user = CONFIG.get("MQTT_USER")
-    mqtt_pass = CONFIG.get("MQTT_PASSWORD")
-    if mqtt_user and mqtt_pass:
-        client.username_pw_set(mqtt_user, mqtt_pass)
+    if CONFIG.get("MQTT_USER"):
+        mqtt_client.username_pw_set(CONFIG["MQTT_USER"], CONFIG["MQTT_PASSWORD"])
 
-    # 4. Connection
-    mqtt_host = CONFIG["MQTT_BROKER_HOST"]
-    mqtt_port = int(CONFIG["MQTT_BROKER_PORT"])
-
-    print(f"Connecting to MQTT broker at {mqtt_host}:{mqtt_port}...")
+    print(f"Connecting to {host}:{port}...")
     try:
-        client.connect(mqtt_host, mqtt_port, 60)
-    except Exception as e:
-        print(f"Could not connect to MQTT Broker: {e}")
-        exit(1)
-
-    # 5. Start the Loop
-    print("Starting MQTT listener loop...")
-    try:
-        client.loop_forever()
+        mqtt_client.connect(host, port, 60)
+        mqtt_client.loop_forever()
     except KeyboardInterrupt:
-        print("\nProgram terminated by user.")
-    except Exception as e:
-        print(f"\nAn unexpected error occurred in the main loop: {e}")
-
-    print("Program finished.")
+        print("Stopping script...")
+    except Exception as e:  # noqa: BLE001
+        print(f"Could not reach broker: {e}")
